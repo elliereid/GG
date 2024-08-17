@@ -7,16 +7,10 @@ declare_id!("GZUKiow4NdgwoWTxXCPUYtfQoWZoWi4vQ18CPDMipyk");
 pub mod gg_token {
     use super::*;
 
-    // Initialize token with a total supply
     pub fn initialize(ctx: Context<Initialize>, total_supply: u64, name: String, symbol: String) -> Result<()> {
-        // Ensure total supply is greater than zero
         require!(total_supply > 0, CustomError::InvalidTotalSupply);
-        
-        // Ensure token name and symbol are not empty
         require!(!name.is_empty(), CustomError::InvalidTokenName);
         require!(!symbol.is_empty(), CustomError::InvalidTokenSymbol);
-        
-        // Ensure initialization can only happen once
         require!(ctx.accounts.token_details.total_supply == 0, CustomError::AlreadyInitialized);
 
         let cpi_accounts = MintTo {
@@ -27,10 +21,8 @@ pub mod gg_token {
         let cpi_program = ctx.accounts.token_program.to_account_info();
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
 
-        // Mint the total supply of tokens to the token account
         token::mint_to(cpi_ctx, total_supply)?;
         
-        // Store token details in the global state
         let token_details = &mut ctx.accounts.token_details;
         token_details.name = name;
         token_details.symbol = symbol;
@@ -42,47 +34,32 @@ pub mod gg_token {
         token_details.collective_reserves = 11_000_000;
         token_details.development_fund = 9_900_000;
         token_details.reserve = 1_100_000;
-
-        // Set lock period for second offering (1 year)
         token_details.second_offering_unlock_time = Clock::get()?.unix_timestamp + 365 * 24 * 60 * 60;
 
         Ok(())
     }
 
-    // Lock tokens for a fixed period (specific to second offering)
     pub fn lock_tokens(ctx: Context<LockTokens>, amount: u64) -> Result<()> {
-        // Ensure the amount to lock is greater than zero
         require!(amount > 0, CustomError::InvalidLockAmount);
-        
-        // Ensure the owner has enough tokens to lock
         require!(ctx.accounts.owner_token_account.amount >= amount, CustomError::InsufficientBalance);
 
         let lock_account = &mut ctx.accounts.lock_account;
         lock_account.amount = amount;
-        lock_account.lock_period = 365 * 24 * 60 * 60; // 365 days in seconds
+        lock_account.lock_period = 365 * 24 * 60 * 60;
         lock_account.owner = *ctx.accounts.owner.key;
         lock_account.unlock_time = Clock::get()?.unix_timestamp + lock_account.lock_period as i64;
 
         Ok(())
     }
 
-    // Unlock tokens after the lock period has ended
     pub fn unlock_tokens(ctx: Context<UnlockTokens>) -> Result<()> {
         let lock_account = &mut ctx.accounts.lock_account;
 
-        // Ensure the current time is past the unlock time
-        require!(
-            Clock::get()?.unix_timestamp >= lock_account.unlock_time,
-            CustomError::LockPeriodNotOver
-        );
-
-        // Ensure the lock account has a positive balance
+        require!(Clock::get()?.unix_timestamp >= lock_account.unlock_time, CustomError::LockPeriodNotOver);
         require!(lock_account.amount > 0, CustomError::NoTokensToUnlock);
 
-        // Store the amount to transfer
         let amount = lock_account.amount;
 
-        // Transfer the locked tokens to the destination account
         let cpi_accounts = Transfer {
             from: ctx.accounts.lock_account.to_account_info(),
             to: ctx.accounts.destination.to_account_info(),
@@ -95,31 +72,42 @@ pub mod gg_token {
         Ok(())
     }
 
-    // Distribute revenue proportionally to token holders
-pub fn distribute_revenue(ctx: Context<DistributeRevenue>, amount: u64) -> Result<()> {
-    let token_details = &ctx.accounts.token_details;
+    pub fn distribute_revenue(ctx: Context<DistributeRevenue>, amount: u64) -> Result<()> {
+        let token_details = &ctx.accounts.token_details;
+        require!(amount > 0, CustomError::InvalidRevenueAmount);
+        require!(token_details.total_supply > 0, CustomError::ZeroTotalSupply);
 
-    // Ensure revenue amount is greater than zero
-    require!(amount > 0, CustomError::InvalidRevenueAmount);
-    
-    // Ensure total supply is greater than zero to avoid division by zero
-    require!(token_details.total_supply > 0, CustomError::ZeroTotalSupply);
+        let total_supply = token_details.total_supply;
 
-    let total_supply = token_details.total_supply;
+        for holder_info in ctx.remaining_accounts.iter() {
+            distribute_to_holder(&ctx, holder_info, total_supply, amount)?;
+        }
 
-    for holder_info in ctx.remaining_accounts.iter() {
-        distribute_to_holder(&ctx, holder_info, total_supply, amount)?;  // Pass &ctx here
+        Ok(())
     }
 
-    Ok(())
-}
+    fn distribute_to_holder<'info>(
+        ctx: &Context<DistributeRevenue<'info>>,
+        holder_info: &AccountInfo<'info>,
+        total_supply: u64,
+        amount: u64,
+    ) -> Result<()> {
+        let holder_account = Account::<TokenAccount>::try_from(holder_info)?;
+        let holder_share = amount * holder_account.amount / total_supply;
 
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.revenue_pool.to_account_info(),
+            to: holder_info.clone(),
+            authority: ctx.accounts.distributor.to_account_info(),
+        };
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
 
+        token::transfer(cpi_ctx, holder_share)?;
+        Ok(())
+    }
 
-
-    // Create new governance proposal (restricted to Admin)
     pub fn create_proposal(ctx: Context<CreateProposal>, description: String) -> Result<()> {
-        // Ensure the proposal description is not empty
         require!(!description.is_empty(), CustomError::InvalidProposalDescription);
 
         let proposal = &mut ctx.accounts.proposal;
@@ -127,28 +115,19 @@ pub fn distribute_revenue(ctx: Context<DistributeRevenue>, amount: u64) -> Resul
         proposal.creator = ctx.accounts.creator.key();
         proposal.votes_for = 0;
         proposal.votes_against = 0;
-        proposal.voting_deadline = Clock::get()?.unix_timestamp + 7 * 24 * 60 * 60; // 1 week voting period
+        proposal.voting_deadline = Clock::get()?.unix_timestamp + 7 * 24 * 60 * 60;
         proposal.passed = false;
 
         Ok(())
     }
 
-    // Vote on existing governance proposal (one vote per wallet)
     pub fn vote_on_proposal(ctx: Context<VoteOnProposal>, vote_for: bool) -> Result<()> {
         let proposal = &mut ctx.accounts.proposal;
 
-        // Check that voting is still open
-        require!(
-            Clock::get()?.unix_timestamp <= proposal.voting_deadline,
-            CustomError::VotingPeriodEnded
-        );
+        require!(Clock::get()?.unix_timestamp <= proposal.voting_deadline, CustomError::VotingPeriodEnded);
 
-        // Check that voter hasn't already voted
         let voter = &ctx.accounts.voter;
-        require!(
-            !proposal.voters.contains(&voter.key()),
-            CustomError::AlreadyVoted
-        );
+        require!(!proposal.voters.contains(&voter.key()), CustomError::AlreadyVoted);
 
         if vote_for {
             proposal.votes_for += 1;
@@ -156,10 +135,8 @@ pub fn distribute_revenue(ctx: Context<DistributeRevenue>, amount: u64) -> Resul
             proposal.votes_against += 1;
         }
 
-        // Add voter to list of voters
         proposal.voters.push(voter.key());
 
-        // Determine if the proposal passes (quorum and majority needed)
         let total_votes = proposal.votes_for + proposal.votes_against;
         if total_votes > 0 && proposal.votes_for as f64 / total_votes as f64 > 0.5 {
             proposal.passed = true;
@@ -167,9 +144,7 @@ pub fn distribute_revenue(ctx: Context<DistributeRevenue>, amount: u64) -> Resul
         Ok(())
     }
 
-    // Handle the initial and second token sale (without KYC)
     pub fn initial_sale(ctx: Context<Sale>, amount: u64) -> Result<()> {
-        // Transfer tokens to the buyer
         let cpi_accounts = Transfer {
             from: ctx.accounts.sale_account.to_account_info(),
             to: ctx.accounts.buyer_token_account.to_account_info(),
@@ -183,12 +158,8 @@ pub fn distribute_revenue(ctx: Context<DistributeRevenue>, amount: u64) -> Resul
     }
 
     pub fn second_sale(ctx: Context<Sale>, amount: u64) -> Result<()> {
-        // Transfer tokens to the buyer (after the 1-year lock period)
         let token_details = &ctx.accounts.token_details;
-        require!(
-            Clock::get()?.unix_timestamp >= token_details.second_offering_unlock_time,
-            CustomError::LockPeriodNotOver
-        );
+        require!(Clock::get()?.unix_timestamp >= token_details.second_offering_unlock_time, CustomError::LockPeriodNotOver);
 
         let cpi_accounts = Transfer {
             from: ctx.accounts.sale_account.to_account_info(),
@@ -201,124 +172,116 @@ pub fn distribute_revenue(ctx: Context<DistributeRevenue>, amount: u64) -> Resul
         token::transfer(cpi_ctx, amount)?;
         Ok(())
     }
-
-    // Add other functions as needed (e.g., staking, burning)
 }
-
-// Contexts for function calls
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
     #[account(mut)]
-    pub mint: Account<'info, Mint>, // Token mint account
+    pub mint: Account<'info, Mint>,
     #[account(mut)]
-    pub token_account: Account<'info, TokenAccount>, // Token account to receive the total supply
+    pub token_account: Account<'info, TokenAccount>,
     #[account(mut)]  
-    pub mint_authority: Signer<'info>, // Authority allowed to mint tokens
-    #[account(init, payer = mint_authority, space = 8 + 192)]  // Adjust space calculation here
-    pub token_details: Account<'info, TokenDetails>, // Token details account
-    pub token_program: Program<'info, token::Token>, // Token program
-    pub system_program: Program<'info, System>, // System program
+    pub mint_authority: Signer<'info>,
+    #[account(init, payer = mint_authority, space = 8 + 192)]
+    pub token_details: Account<'info, TokenDetails>,
+    pub token_program: Program<'info, token::Token>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
 pub struct LockTokens<'info> {
-    #[account(init, payer = owner, space = 8 + 32 + 8 + 8 + 8)] // Adjust space calculation
-    pub lock_account: Account<'info, LockAccount>, // Lock account to store locked tokens
+    #[account(init, payer = owner, space = 8 + 32 + 8 + 8 + 8)]
+    pub lock_account: Account<'info, LockAccount>,
     #[account(mut)]
-    pub owner: Signer<'info>, // Owner of the locked tokens
+    pub owner: Signer<'info>,
     #[account(mut)]
-    pub owner_token_account: Account<'info, TokenAccount>, // Owner's token account to check balance
-    pub system_program: Program<'info, System>, // System program
-    pub token_program: Program<'info, token::Token>, // Token program
+    pub owner_token_account: Account<'info, TokenAccount>,
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, token::Token>,
 }
 
 #[derive(Accounts)]
 pub struct UnlockTokens<'info> {
     #[account(mut, has_one = owner)]
-    pub lock_account: Account<'info, LockAccount>, // Lock account storing locked tokens
+    pub lock_account: Account<'info, LockAccount>,
     #[account(mut)]
-    pub destination: Account<'info, TokenAccount>, // Destination account to receive unlocked tokens
-    pub owner: Signer<'info>, // Owner of the locked tokens
-    pub token_program: Program<'info, token::Token>, // Token program
+    pub destination: Account<'info, TokenAccount>,
+    pub owner: Signer<'info>,
+    pub token_program: Program<'info, token::Token>,
 }
 
 #[derive(Accounts)]
 pub struct DistributeRevenue<'info> {
     #[account(mut)]
-    pub revenue_pool: Account<'info, TokenAccount>, // Account holding the revenue to be distributed
+    pub revenue_pool: Account<'info, TokenAccount>,
     #[account(mut)]
-    pub token_details: Account<'info, TokenDetails>, // Token details account
-    pub distributor: Signer<'info>, // Authority allowed to distribute revenue
-    pub token_program: Program<'info, token::Token>, // Token program
+    pub token_details: Account<'info, TokenDetails>,
+    pub distributor: Signer<'info>,
+    pub token_program: Program<'info, token::Token>,
 }
 
 #[derive(Accounts)]
 pub struct CreateProposal<'info> {
-    #[account(init, payer = creator, space = 8 + 32 + 4 + 64 + 8 + 8 + 8 + 1 + (4 + 32 * 100))] // Adjust space calculation
-    pub proposal: Account<'info, Proposal>, // Proposal account
+    #[account(init, payer = creator, space = 8 + 32 + 4 + 64 + 8 + 8 + 8 + 1 + (4 + 32 * 100))]
+    pub proposal: Account<'info, Proposal>,
     #[account(mut)]
-    pub creator: Signer<'info>, // Creator of the proposal
-    pub system_program: Program<'info, System>, // System program
+    pub creator: Signer<'info>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
 pub struct VoteOnProposal<'info> {
     #[account(mut, has_one = creator)]
-    pub proposal: Account<'info, Proposal>, // Proposal account
-    pub voter: Signer<'info>, // Voter
-    pub creator: Signer<'info>, // Creator of the proposal
+    pub proposal: Account<'info, Proposal>,
+    pub voter: Signer<'info>,
+    pub creator: Signer<'info>,
 }
 
 #[derive(Accounts)]
 pub struct Sale<'info> {
     #[account(mut)]
-    pub sale_account: Account<'info, TokenAccount>, // Account holding the tokens for sale
+    pub sale_account: Account<'info, TokenAccount>,
     #[account(mut)]
-    pub buyer_token_account: Account<'info, TokenAccount>, // Buyer's token account
-    pub sale_authority: Signer<'info>, // Authority allowed to sell tokens
-    pub token_program: Program<'info, token::Token>, // Token program
-    #[account(mut)]  // Include if you need token details in sale
-    pub token_details: Account<'info, TokenDetails>, // Token details account
+    pub buyer_token_account: Account<'info, TokenAccount>,
+    pub sale_authority: Signer<'info>,
+    pub token_program: Program<'info, token::Token>,
+    #[account(mut)]
+    pub token_details: Account<'info, TokenDetails>,
 }
-
-// Data Structures
 
 #[account]
 pub struct TokenDetails {
-    pub name: String,         // Token name
-    pub symbol: String,       // Token symbol
-    pub total_supply: u64,    // Total supply of tokens
-    pub mint: Pubkey,         // Mint account
-    pub owner: Pubkey,        // Contract owner
-    pub initial_offering: u64, // Initial offering allocation
-    pub second_offering: u64, // Second offering allocation
-    pub collective_reserves: u64, // Collective reserves
-    pub development_fund: u64, // Development fund
-    pub reserve: u64,         // Reserve fund
-    pub second_offering_unlock_time: i64, // Unlock time for second offering
+    pub name: String,
+    pub symbol: String,
+    pub total_supply: u64,
+    pub mint: Pubkey,
+    pub owner: Pubkey,
+    pub initial_offering: u64,
+    pub second_offering: u64,
+    pub collective_reserves: u64,
+    pub development_fund: u64,
+    pub reserve: u64,
+    pub second_offering_unlock_time: i64,
 }
 
 #[account]
 pub struct LockAccount {
-    pub owner: Pubkey,        // Owner of the lock account
-    pub amount: u64,          // Amount of tokens locked
-    pub lock_period: u64,     // Lock period in seconds (fixed at 365 days)
-    pub unlock_time: i64,     // Timestamp when tokens can be unlocked
+    pub owner: Pubkey,
+    pub amount: u64,
+    pub lock_period: u64,
+    pub unlock_time: i64,
 }
 
 #[account]
 pub struct Proposal {
-    pub creator: Pubkey,      // Creator of the proposal
-    pub description: String,  // Description of the proposal
-    pub votes_for: u64,       // Number of votes in favor
-    pub votes_against: u64,   // Number of votes against
-    pub voting_deadline: i64, // Voting deadline timestamp
-    pub passed: bool,         // Whether the proposal has passed
-    pub voters: Vec<Pubkey>,  // List of voters who have voted
+    pub creator: Pubkey,
+    pub description: String,
+    pub votes_for: u64,
+    pub votes_against: u64,
+    pub voting_deadline: i64,
+    pub passed: bool,
+    pub voters: Vec<Pubkey>,
 }
-
-// Error Handling
 
 #[error_code]
 pub enum CustomError {
